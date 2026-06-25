@@ -82,17 +82,17 @@ kong_repro_123_count{route="users"} 10
 kong_repro_123_sum{route="users"} 500
 ```
 
-2. **Scrape 2 (`startTime + scrapeInterval`):** Normal subsequent observation. Ingested successfully into Cloud Monitoring with StartTime = `startTime`, EndTime = `scrapeTime2`.
+2. **Scrape 2 (`scrapeTime2 = startTime + scrapeInterval`):** Simulates explicit Kong worker restart where cumulative counters reset (`1 < 10`). Ingested successfully into Cloud Monitoring with StartTime = `scrapeTime2 - 1ms`, EndTime = `scrapeTime2`.
 ```text
 # HELP kong_repro_123 Kong latency
 # TYPE kong_repro_123 histogram
-kong_repro_123_bucket{route="users",le="100"} 20
-kong_repro_123_bucket{route="users",le="+Inf"} 20
-kong_repro_123_count{route="users"} 20
-kong_repro_123_sum{route="users"} 1000
+kong_repro_123_bucket{route="users",le="100"} 1
+kong_repro_123_bucket{route="users",le="+Inf"} 1
+kong_repro_123_count{route="users"} 1
+kong_repro_123_sum{route="users"} 50
 ```
 
-3. **Scrape 3 (at identical EndTime `scrapeTime2`):** Replays Kong format anomaly where mid-scrape yielding causes `_count` to drop relative to the prior scrape (`2 < 20`).
+3. **Scrape 3 (`scrapeTime3 = scrapeTime2 + scrapeInterval`):** Subsequent normal observation spaced by `scrapeInterval`. Replays unfixed regression where uncoordinated zero buckets or cache desynchronization submit an older baseline start time (`startTime < scrapeTime2 - 1ms`).
 ```text
 # HELP kong_repro_123 Kong latency
 # TYPE kong_repro_123 histogram
@@ -102,7 +102,7 @@ kong_repro_123_count{route="users"} 2
 kong_repro_123_sum{route="users"} 100
 ```
 
-When GMP's unfixed `getResetAdjusted` processes Scrape 3, because `v < lastValue` (`2 < 20`), it resets the start timestamp to `scrapeTime2 - 1ms`. When sent to Cloud Monitoring / Monarch, Monarch rejects the write with:
+When sent to Cloud Monitoring / Monarch with StartTime = `startTime` (< `lastStart` `scrapeTime2 - 1ms`), Monarch rejects the write with:
 ```
 CreateTimeSeries call failed: rpc error: code = InvalidArgument desc = One or more of the points specified had an older start time than the most recent point
 ```
