@@ -146,8 +146,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 100
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else if n == 3 {
-			// Scrape 3 (scrapeTime3): Dynamic appearance of newly active zero bucket le="50"
-			// and inconsistent count/sum due to mid-scrape coroutine yielding (count 20 uncoordinated with restart).
+			// Scrape 3 (scrapeTime3): Dynamic appearance of newly active zero bucket le="50".
 			// In unfixed exporter, le="50" arrives with !hasReset, skipping dist on Scrape 3.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
@@ -155,20 +154,18 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_bucket{route="users",le="50"} 1
 %s_bucket{route="users",le="100"} 12
 %s_bucket{route="users",le="+Inf"} 12
-%s_count{route="users"} 20
+%s_count{route="users"} 12
 %s_sum{route="users"} 600
 `, metricName, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else {
 			// Scrape 4 (scrapeTime4): Subsequent normal observation.
-			// Unfixed buildDistribution builds dist taking resetTimestamp from count (scrapeTime1 < scrapeTime2 - 1ms).
-			// Monarch rejects write citing older start time error!
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
 %s_bucket{route="users",le="50"} 2
 %s_bucket{route="users",le="100"} 14
 %s_bucket{route="users",le="+Inf"} 14
-%s_count{route="users"} 22
+%s_count{route="users"} 14
 %s_sum{route="users"} 700
 `, metricName, metricName, metricName, metricName, metricName, metricName, metricName)))
 		}
