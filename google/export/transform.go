@@ -429,19 +429,11 @@ Loop:
 			continue
 		}
 
-		suffix := metricSuffix(name[len(metric):])
-		var rt int64
-		var v float64
-		var resetOk bool
-		if suffix == metricSuffixBucket {
-			rt, v, resetOk = b.series.getResetAdjustedBucket(storage.SeriesRef(s.Ref), s.T, s.V)
-		} else {
-			rt, v, resetOk = b.series.getResetAdjusted(storage.SeriesRef(s.Ref), s.T, s.V)
-		}
+		rt, v, ok := b.series.getResetAdjusted(storage.SeriesRef(s.Ref), s.T, s.V)
 		// If a series appeared for the first time, we won't get a valid reset timestamp yet.
-		// This may happen if the histogram is entirely new.
+		// This may happen if the histogram is entirely new or if new series appeared through bucket changes.
 		// We skip the entire distribution sample in this case.
-		if !resetOk {
+		if !ok {
 			dist.skip = true
 			continue
 		}

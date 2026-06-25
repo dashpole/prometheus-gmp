@@ -65,9 +65,6 @@ type seriesCache struct {
 
 	// Prefix under which metrics are written to GCM.
 	metricTypePrefix string
-
-	// Map from cumulative histogram hash to its authoritative reset timestamp.
-	histogramResets map[uint64]int64
 }
 
 type seriesCacheEntry struct {
@@ -143,7 +140,6 @@ func newSeriesCache(logger log.Logger, reg prometheus.Registerer, metricTypePref
 		pool:             newPool(reg),
 		entries:          map[storage.SeriesRef]*seriesCacheEntry{},
 		metricTypePrefix: metricTypePrefix,
-		histogramResets:  map[uint64]int64{},
 	}
 }
 
@@ -217,9 +213,6 @@ func (c *seriesCache) clear() {
 		c.pool.release(entry.protos.cumulative.proto)
 		delete(c.entries, ref)
 	}
-	for k := range c.histogramResets {
-		delete(c.histogramResets, k)
-	}
 }
 
 // garbageCollect drops obsolete cache entries that have not been updated for
@@ -239,24 +232,15 @@ func (c *seriesCache) garbageCollect(delay time.Duration) error {
 	// up our memory usage in high-churn environments.
 	deleteBefore := start.Add(-delay).Unix()
 	i := 0
-	activeHashes := make(map[uint64]struct{})
 
 	for ref, entry := range c.entries {
 		if entry.lastUsed >= deleteBefore {
-			if entry.metadata.Type == model.MetricTypeHistogram {
-				activeHashes[entry.protos.cumulative.hash] = struct{}{}
-			}
 			continue
 		}
 		c.pool.release(entry.protos.gauge.proto)
 		c.pool.release(entry.protos.cumulative.proto)
 		delete(c.entries, ref)
 		i++
-	}
-	for h := range c.histogramResets {
-		if _, ok := activeHashes[h]; !ok {
-			delete(c.histogramResets, h)
-		}
 	}
 	//nolint:errcheck
 	level.Info(c.logger).Log("msg", "garbage collection completed", "took", time.Since(start), "seriesPurged", i)
@@ -306,11 +290,6 @@ func (c *seriesCache) getResetAdjusted(ref storage.SeriesRef, t int64, v float64
 	if !hasReset {
 		e.resetTimestamp = t
 		e.resetValue = v
-		if e.metadata.Type == model.MetricTypeHistogram && e.suffix == metricSuffixCount {
-			c.mtx.Lock()
-			c.histogramResets[e.protos.cumulative.hash] = t
-			c.mtx.Unlock()
-		}
 		// If we just initialized the reset timestamp, this sample should be skipped.
 		// We don't know the window over which the current cumulative value was built up over.
 		// The next sample for will be considered from this point onwards.
@@ -332,51 +311,6 @@ func (c *seriesCache) getResetAdjusted(ref storage.SeriesRef, t int64, v float64
 		// before the timestamp of the current sample.
 		// We don't know the true reset time but this ensures the range is non-zero
 		// while unlikely to conflict with any previous sample.
-		e.resetValue = 0
-		e.resetTimestamp = t - 1
-		if e.metadata.Type == model.MetricTypeHistogram && e.suffix == metricSuffixCount {
-			c.mtx.Lock()
-			c.histogramResets[e.protos.cumulative.hash] = e.resetTimestamp
-			c.mtx.Unlock()
-		}
-	}
-	e.lastValue = v
-
-	return e.resetTimestamp, v - e.resetValue, true
-}
-
-// getResetAdjustedBucket takes a bucket sample for a referenced histogram series
-// and returns its reset timestamp and adjusted value.
-// Unlike standard series, dynamically appearing histogram buckets (e.g. zero-count
-// buckets omitted by Kong) initialize their baseline reset value to 0 so they do not
-// skip distribution samples or distort cumulative bucket counts.
-func (c *seriesCache) getResetAdjustedBucket(ref storage.SeriesRef, t int64, v float64) (int64, float64, bool) {
-	c.mtx.Lock()
-	e, ok := c.entries[ref]
-	c.mtx.Unlock()
-	if !ok {
-		return 0, 0, false
-	}
-	hasReset := e.hasReset
-	e.hasReset = true
-	if !hasReset {
-		c.mtx.Lock()
-		rt, established := c.histogramResets[e.protos.cumulative.hash]
-		c.mtx.Unlock()
-		if established && rt < t {
-			e.resetTimestamp = rt
-			e.resetValue = 0
-			e.lastValue = v
-			return rt, v, true
-		}
-		e.resetTimestamp = t
-		e.resetValue = v
-		e.lastValue = v
-		return 0, 0, false
-	} else if t <= e.resetTimestamp {
-		return 0, 0, false
-	}
-	if v < e.lastValue {
 		e.resetValue = 0
 		e.resetTimestamp = t - 1
 	}
