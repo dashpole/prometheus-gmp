@@ -57,22 +57,52 @@ Stepping through metric_data() coroutine:
 
 ---
 
-## 3. Triggering Cloud Monitoring Errors via Live Integration Test (Phase 2)
+## 3. Triggering Cloud Monitoring Errors via Scrape Integration Test (Phase 2)
 
-To confirm that Monarch rejects time series exhibiting Kong's counter desynchronization, we authored `kong_monarch_integration_test.go` (`TestKongMonarchLiveIntegration`).
+To confirm that Monarch rejects time series exhibiting Kong's counter desynchronization and dynamic bucket appearance when scraped via standard Prometheus libraries, we authored `kong_scrape_integration_test.go` (`TestKongHistogramScrapeMonarchIntegration`).
 
 ### Verifiable Reviewer Steps
 
-Run the live Cloud Monitoring integration test using active OAuth2 credentials:
+By default (`RUN_LIVE_MONARCH_TEST=0`), the integration test runs against a local mock validation server with 100ms scrape intervals for rapid execution (~0.5s). To run against real live Cloud Monitoring API using active OAuth2 credentials (with 6-second rate limit spacing):
 
 ```bash
-RUN_LIVE_MONARCH_TEST=1 GCM_ACCESS_TOKEN=$(gcloud auth print-access-token) go test -v ./google/export -run TestKongMonarchLiveIntegration
+RUN_LIVE_MONARCH_TEST=1 GCM_ACCESS_TOKEN=$(gcloud auth print-access-token) go test -v ./google/export -run TestKongHistogramScrapeMonarchIntegration
 ```
 
-### Verified Rejection Behavior
-The test connects directly to live Cloud Monitoring (`monitoring.NewMetricClient`) in project `dashpole-dev`, writes an initial cumulative distribution sample (`startTime1`), waits 6 seconds to satisfy rate limits, and writes a second sample with an older start time (`startTime1 - 10s`). 
+### Verified Rejection Behavior & Text Format Inputs
+The test sets up an HTTP server serving Prometheus text format metrics, parses them via the real Prometheus `textparse` library, and ingests them into GMP's custom `scrapeAppender` and `Exporter` pipeline connected to Cloud Monitoring in project `dashpole-dev`.
 
-Monarch rejects the second write with:
+1. **Scrape 1 (`startTime`):** Establishes baseline cumulative histogram tracking.
+```text
+# HELP kong_repro_123 Kong latency
+# TYPE kong_repro_123 histogram
+kong_repro_123_bucket{route="users",le="100"} 10
+kong_repro_123_bucket{route="users",le="+Inf"} 10
+kong_repro_123_count{route="users"} 10
+kong_repro_123_sum{route="users"} 500
+```
+
+2. **Scrape 2 (`startTime + scrapeInterval`):** Normal subsequent observation. Ingested successfully into Cloud Monitoring with StartTime = `startTime`, EndTime = `scrapeTime2`.
+```text
+# HELP kong_repro_123 Kong latency
+# TYPE kong_repro_123 histogram
+kong_repro_123_bucket{route="users",le="100"} 20
+kong_repro_123_bucket{route="users",le="+Inf"} 20
+kong_repro_123_count{route="users"} 20
+kong_repro_123_sum{route="users"} 1000
+```
+
+3. **Scrape 3 (at identical EndTime `scrapeTime2`):** Replays Kong format anomaly where mid-scrape yielding causes `_count` to drop relative to the prior scrape (`2 < 20`).
+```text
+# HELP kong_repro_123 Kong latency
+# TYPE kong_repro_123 histogram
+kong_repro_123_bucket{route="users",le="100"} 2
+kong_repro_123_bucket{route="users",le="+Inf"} 2
+kong_repro_123_count{route="users"} 2
+kong_repro_123_sum{route="users"} 100
+```
+
+When GMP's unfixed `getResetAdjusted` processes Scrape 3, because `v < lastValue` (`2 < 20`), it resets the start timestamp to `scrapeTime2 - 1ms`. When sent to Cloud Monitoring / Monarch, Monarch rejects the write with:
 ```
 CreateTimeSeries call failed: rpc error: code = InvalidArgument desc = One or more of the points specified had an older start time than the most recent point
 ```
@@ -93,7 +123,8 @@ To ensure resilient ingestion without dropping distributions or corrupting reset
 
 * `verify_kong_lua.lua`: Standalone Lua test harness executing Kong's real Prometheus library.
 * `kong_prometheus.lua`: Kong Prometheus plugin library source (`prometheus.lua`).
-* `../../google/export/kong_monarch_integration_test.go`: Live Cloud Monitoring integration test verifying Monarch start time rejections.
+* `../../google/export/kong_scrape_integration_test.go`: Scrape integration test parsing Prometheus text format inputs and verifying Monarch start time rejections.
+* `../../google/export/kong_monarch_integration_test.go`: Direct Monarch client integration test verifying interval start time regressions.
 * `../../google/export/kong_histogram_test.go`: Table-driven unit test suite reproducing dynamic bucket appearance and counter desynchronization.
 * `../../google/export/series_cache.go`: Updated series cache implementing normalization and map cleanup.
 * `../../google/export/transform.go`: Updated distribution builder routing bucket samples to `getResetAdjustedBucket`.
