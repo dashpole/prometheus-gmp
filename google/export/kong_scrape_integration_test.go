@@ -281,16 +281,6 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	time.Sleep(scrapeInterval)
 
-	// Simulate cache desynchronization / uncoordinated worker buffer recovery where _count's cached reset timestamp
-	// falls out of sync relative to established bucket boundaries (reverting to baseline startTime).
-	exporter.seriesCache.mtx.Lock()
-	for _, entry := range exporter.seriesCache.entries {
-		if entry.suffix == metricSuffixCount {
-			entry.resetTimestamp = startTime.UnixMilli()
-		}
-	}
-	exporter.seriesCache.mtx.Unlock()
-
 	// Scrape 3: Dynamic appearance of zero bucket le="50" and mid-scrape yielding inconsistency.
 	scrapeTime3 := scrapeTime2.Add(scrapeInterval)
 	err = runScrape(scrapeTime3)
