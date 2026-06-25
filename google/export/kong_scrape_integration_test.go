@@ -135,8 +135,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 500
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else if n == 3 {
-			// Scrape 2 (scrapeTime2): Simulates explicit Kong worker restart where cumulative counter resets.
-			// GMP's getResetAdjusted sets reset timestamp to scrapeTime2 - 1ms.
+			// Scrape 2: Mimic TSDB Series Ref Churn where counter reset appears under temporary re-indexed series ref.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -146,8 +145,17 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 100
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else if n == 4 {
-			// Scrape 3 (scrapeTime3): Dynamic appearance of newly active zero bucket le="50".
-			// In unfixed exporter, le="50" arrives with !hasReset, skipping dist on Scrape 3.
+			// Scrape 2.5: Confirm counter reset progression under temporary re-indexed series ref so Monarch records new start timestamp.
+			w.Write([]byte(fmt.Sprintf(`
+# HELP %s Kong latency
+# TYPE %s histogram
+%s_bucket{route="users",le="100"} 4
+%s_bucket{route="users",le="+Inf"} 4
+%s_count{route="users"} 4
+%s_sum{route="users"} 200
+`, metricName, metricName, metricName, metricName, metricName, metricName)))
+		} else if n == 5 {
+			// Scrape 3: TSDB re-indexing returns to original baseline series ref. Dynamic bucket le="50" appears mid-stream.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -158,7 +166,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 600
 `, metricName, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else {
-			// Scrape 4 (scrapeTime4): Subsequent normal observation.
+			// Scrape 4: Subsequent normal observation under original baseline series ref.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -261,7 +269,8 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 		scrapeInterval = 6 * time.Second
 	}
 
-	// Scrape 1: Baseline observation.
+	// Scrape 1: Baseline observation under original series ref.
+	store.SetSeriesRefMask(0)
 	err = runScrape(startTime)
 	require.NoError(t, err)
 
@@ -274,21 +283,30 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 2: Simulates explicit Kong worker restart where cumulative counter resets.
+	// Scrape 2: Mimic TSDB Series Ref Churn (e.g. head compaction / series re-indexing) assigning temporary series ref.
+	store.SetSeriesRefMask(0x99999999)
 	scrapeTime2 := scrapeTime15.Add(scrapeInterval)
 	err = runScrape(scrapeTime2)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 3: Dynamic appearance of zero bucket le="50" and mid-scrape yielding inconsistency.
-	scrapeTime3 := scrapeTime2.Add(scrapeInterval)
+	// Scrape 2.5: Confirm counter reset progression under temporary re-indexed series ref so Monarch records new start timestamp.
+	scrapeTime25 := scrapeTime2.Add(scrapeInterval)
+	err = runScrape(scrapeTime25)
+	require.NoError(t, err)
+
+	time.Sleep(scrapeInterval)
+
+	// Scrape 3: TSDB re-indexing returns to original baseline series ref.
+	store.SetSeriesRefMask(0)
+	scrapeTime3 := scrapeTime25.Add(scrapeInterval)
 	err = runScrape(scrapeTime3)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 4: Subsequent normal observation.
+	// Scrape 4: Subsequent normal observation under original baseline series ref.
 	scrapeTime4 := scrapeTime3.Add(scrapeInterval)
 	err = runScrape(scrapeTime4)
 	require.NoError(t, err)

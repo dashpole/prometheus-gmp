@@ -39,8 +39,9 @@ type Storage struct {
 	exporter     *Exporter
 	metadataFunc MetadataFunc
 
-	mtx    sync.Mutex
-	labels map[storage.SeriesRef]labels.Labels
+	mtx           sync.Mutex
+	labels        map[storage.SeriesRef]labels.Labels
+	seriesRefMask uint64
 }
 
 // NewStorage returns a new Prometheus storage that's exporting data via the exporter.
@@ -74,11 +75,17 @@ func (s *Storage) labelsByID(id storage.SeriesRef) labels.Labels {
 }
 
 func (s *Storage) setLabels(lset labels.Labels) storage.SeriesRef {
-	h := storage.SeriesRef(lset.Hash())
 	s.mtx.Lock()
+	h := storage.SeriesRef(lset.Hash() ^ s.seriesRefMask)
 	s.labels[h] = lset
 	s.mtx.Unlock()
 	return h
+}
+
+func (s *Storage) SetSeriesRefMask(mask uint64) {
+	s.mtx.Lock()
+	s.seriesRefMask = mask
+	s.mtx.Unlock()
 }
 
 func (s *Storage) clearLabels(samples []record.RefSample) {
