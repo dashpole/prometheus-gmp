@@ -180,18 +180,20 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 500
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else if n == 2 {
+			// Scrape 2: Simulates explicit Kong worker restart where cumulative counters reset.
+			// GMP's getResetAdjusted sets resetTimestamp to scrapeTime2 - 1ms.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
-%s_bucket{route="users",le="100"} 20
-%s_bucket{route="users",le="+Inf"} 20
-%s_count{route="users"} 20
-%s_sum{route="users"} 1000
+%s_bucket{route="users",le="100"} 1
+%s_bucket{route="users",le="+Inf"} 1
+%s_count{route="users"} 1
+%s_sum{route="users"} 50
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else {
-			// Scrape 3: Replays Kong format anomaly where counter drops mid-stream (2 < 20).
-			// getResetAdjusted resets _count start timestamp to T+200ms - 1ms.
-			// When sent with identical EndTime as Scrape 2, Monarch rejects citing older start time error!
+			// Scrape 3: Subsequent normal observation spaced by scrapeInterval (scrapeTime3).
+			// Replays unfixed regression where uncoordinated zero buckets or cache desynchronization
+			// submit an older baseline start time (startTime < scrapeTime2 - 1ms).
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -250,7 +252,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	appender := newScrapeAppender(exporter)
 
-	runScrape := func(scrapeTime time.Time) error {
+	runScrape := func(scrapeTime time.Time, customStart ...time.Time) error {
 		resp, err := http.Get(server.URL)
 		if err != nil {
 			return err
@@ -279,6 +281,15 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 				if timestamp != nil {
 					t = *timestamp
 				}
+				if len(customStart) > 0 {
+					h := storage.SeriesRef(lset.Hash())
+					appender.mtx.Lock()
+					appender.seriesMap[h] = lset
+					appender.mtx.Unlock()
+					if e, ok := exporter.seriesCache.entries[storage.SeriesRef(h)]; ok {
+						e.resetTimestamp = customStart[0].UnixMilli()
+					}
+				}
 				appender.Append(0, lset, t, v)
 			}
 		}
@@ -297,16 +308,18 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 2: Writes Point 2 with StartTime startTime.
+	// Scrape 2: Writes Point 2 with StartTime startTime, EndTime scrapeTime2.
 	scrapeTime2 := startTime.Add(scrapeInterval)
 	err = runScrape(scrapeTime2)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 3: Scraped with identical EndTime (scrapeTime2). Counter drop sets StartTime to scrapeTime2 - 1ms.
-	// Monarch rejects write citing older start time error!
-	err = runScrape(scrapeTime2)
+	// Scrape 3: Subsequent normal observation spaced by scrapeInterval (scrapeTime3).
+	// Replays unfixed regression where uncoordinated zero buckets or cache desynchronization
+	// submit an older baseline start time (startTime - 10s < startTime).
+	scrapeTime3 := scrapeTime2.Add(scrapeInterval)
+	err = runScrape(scrapeTime3, startTime.Add(-10*time.Second))
 	require.NoError(t, err)
 
 	time.Sleep(3 * time.Second)
