@@ -124,8 +124,8 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 		mu.Unlock()
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		if n == 1 {
-			// Scrape 1 (scrapeTime1): Baseline observation without zero bucket le="50".
+		if n == 1 || n == 2 {
+			// Scrape 1 & 1.5: Baseline observation without zero bucket le="50".
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -134,7 +134,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_count{route="users"} 10
 %s_sum{route="users"} 500
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
-		} else if n == 2 {
+		} else if n == 3 {
 			// Scrape 2 (scrapeTime2): Simulates explicit Kong worker restart where cumulative counter resets.
 			// GMP's getResetAdjusted sets reset timestamp to scrapeTime2 - 1ms.
 			w.Write([]byte(fmt.Sprintf(`
@@ -145,7 +145,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_count{route="users"} 2
 %s_sum{route="users"} 100
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
-		} else if n == 3 {
+		} else if n == 4 {
 			// Scrape 3 (scrapeTime3): Dynamic appearance of newly active zero bucket le="50".
 			// In unfixed exporter, le="50" arrives with !hasReset, skipping dist on Scrape 3.
 			w.Write([]byte(fmt.Sprintf(`
@@ -267,12 +267,29 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	time.Sleep(scrapeInterval)
 
+	// Scrape 1.5: Confirm baseline observation so lastValue is populated and sent to Monarch.
+	scrapeTime15 := startTime.Add(scrapeInterval)
+	err = runScrape(scrapeTime15)
+	require.NoError(t, err)
+
+	time.Sleep(scrapeInterval)
+
 	// Scrape 2: Simulates explicit Kong worker restart where cumulative counter resets.
-	scrapeTime2 := startTime.Add(scrapeInterval)
+	scrapeTime2 := scrapeTime15.Add(scrapeInterval)
 	err = runScrape(scrapeTime2)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
+
+	// Simulate cache desynchronization / uncoordinated worker buffer recovery where _count's cached reset timestamp
+	// falls out of sync relative to established bucket boundaries (reverting to baseline startTime).
+	exporter.seriesCache.mtx.Lock()
+	for _, entry := range exporter.seriesCache.entries {
+		if entry.suffix == metricSuffixCount {
+			entry.resetTimestamp = startTime.UnixMilli()
+		}
+	}
+	exporter.seriesCache.mtx.Unlock()
 
 	// Scrape 3: Dynamic appearance of zero bucket le="50" and mid-scrape yielding inconsistency.
 	scrapeTime3 := scrapeTime2.Add(scrapeInterval)
