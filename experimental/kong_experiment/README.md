@@ -70,9 +70,9 @@ RUN_LIVE_MONARCH_TEST=1 GCM_ACCESS_TOKEN=$(gcloud auth print-access-token) go te
 ```
 
 ### Verified Rejection Behavior & Text Format Inputs
-The test sets up an HTTP server serving Prometheus text format metrics, parses them via the real Prometheus `textparse` library, and ingests them into GMP's custom `scrapeAppender` and `Exporter` pipeline connected to Cloud Monitoring in project `dashpole-dev`.
+The test sets up an HTTP server serving Prometheus text format metrics, parses them via the real Prometheus `textparse` library, and feeds them directly into GMP's authoritative `NewStorage(exporter).Appender(ctx)` pipeline connected to Cloud Monitoring in project `dashpole-dev`.
 
-1. **Scrape 1 (`startTime`):** Establishes baseline cumulative histogram tracking.
+1. **Scrape 1 (`scrapeTime1`):** Establishes baseline cumulative histogram tracking.
 ```text
 # HELP kong_repro_123 Kong latency
 # TYPE kong_repro_123 histogram
@@ -82,17 +82,7 @@ kong_repro_123_count{route="users"} 10
 kong_repro_123_sum{route="users"} 500
 ```
 
-2. **Scrape 2 (`scrapeTime2 = startTime + scrapeInterval`):** Simulates explicit Kong worker restart where cumulative counters reset (`1 < 10`). Ingested successfully into Cloud Monitoring with StartTime = `scrapeTime2 - 1ms`, EndTime = `scrapeTime2`.
-```text
-# HELP kong_repro_123 Kong latency
-# TYPE kong_repro_123 histogram
-kong_repro_123_bucket{route="users",le="100"} 1
-kong_repro_123_bucket{route="users",le="+Inf"} 1
-kong_repro_123_count{route="users"} 1
-kong_repro_123_sum{route="users"} 50
-```
-
-3. **Scrape 3 (`scrapeTime3 = scrapeTime2 + scrapeInterval`):** Subsequent normal observation spaced by `scrapeInterval`. Replays unfixed regression where uncoordinated zero buckets or cache desynchronization submit an older baseline start time (`startTime < scrapeTime2 - 1ms`).
+2. **Scrape 2 (`scrapeTime2`):** Simulates explicit Kong worker restart where cumulative counter resets (`2 < 10`), establishing reset timestamp `scrapeTime2 - 1ms`.
 ```text
 # HELP kong_repro_123 Kong latency
 # TYPE kong_repro_123 histogram
@@ -102,10 +92,18 @@ kong_repro_123_count{route="users"} 2
 kong_repro_123_sum{route="users"} 100
 ```
 
-When sent to Cloud Monitoring / Monarch with StartTime = `startTime` (< `lastStart` `scrapeTime2 - 1ms`), Monarch rejects the write with:
+3. **Scrape 3 (`scrapeTime3`):** Dynamic appearance of newly active zero bucket `le="50"` and mid-scrape yielding inconsistency (`_count 20` uncoordinated with restart).
+```text
+# HELP kong_repro_123 Kong latency
+# TYPE kong_repro_123 histogram
+kong_repro_123_bucket{route="users",le="50"} 1
+kong_repro_123_bucket{route="users",le="100"} 12
+kong_repro_123_bucket{route="users",le="+Inf"} 12
+kong_repro_123_count{route="users"} 20
+kong_repro_123_sum{route="users"} 600
 ```
-CreateTimeSeries call failed: rpc error: code = InvalidArgument desc = One or more of the points specified had an older start time than the most recent point
-```
+
+When ingested into Cloud Monitoring / Monarch, GMP's unfixed `getResetAdjusted` skips distributions on dynamic bucket appearance and rejects out-of-order start times on uncoordinated counter recovery. When normalized with our patch (`getResetAdjustedBucket`), all points ingest cleanly.
 
 ---
 

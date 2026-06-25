@@ -36,9 +36,6 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
-	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/tsdb/chunks"
-	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -100,43 +97,6 @@ func (c *errorCapturingMetricClient) CreateTimeSeries(ctx context.Context, req *
 	return err
 }
 
-type scrapeAppender struct {
-	exporter  *Exporter
-	seriesMap map[storage.SeriesRef]labels.Labels
-	samples   []record.RefSample
-	mtx       sync.Mutex
-}
-
-func newScrapeAppender(exp *Exporter) *scrapeAppender {
-	sa := &scrapeAppender{
-		exporter:  exp,
-		seriesMap: make(map[storage.SeriesRef]labels.Labels),
-		samples:   make([]record.RefSample, 0, 64),
-	}
-	exp.SetLabelsByIDFunc(func(ref storage.SeriesRef) labels.Labels {
-		sa.mtx.Lock()
-		defer sa.mtx.Unlock()
-		return sa.seriesMap[ref]
-	})
-	return sa
-}
-
-func (a *scrapeAppender) Append(_ storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
-	h := storage.SeriesRef(l.Hash())
-	a.mtx.Lock()
-	if !l.IsEmpty() {
-		a.seriesMap[h] = l
-	}
-	a.mtx.Unlock()
-
-	a.samples = append(a.samples, record.RefSample{
-		Ref: chunks.HeadSeriesRef(h),
-		T:   t,
-		V:   v,
-	})
-	return h, nil
-}
-
 func histogramMetadataFunc(metric string) (MetricMetadata, bool) {
 	if strings.HasSuffix(metric, "_bucket") || strings.HasSuffix(metric, "_sum") || strings.HasSuffix(metric, "_count") {
 		return MetricMetadata{}, false
@@ -145,12 +105,6 @@ func histogramMetadataFunc(metric string) (MetricMetadata, bool) {
 		Metric: metric,
 		Type:   model.MetricTypeHistogram,
 	}, true
-}
-
-func (a *scrapeAppender) Commit() error {
-	a.exporter.Export(histogramMetadataFunc, a.samples, nil)
-	a.samples = a.samples[:0]
-	return nil
 }
 
 func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
@@ -171,6 +125,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		if n == 1 {
+			// Scrape 1 (scrapeTime1): Baseline observation without zero bucket le="50".
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -180,20 +135,8 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_sum{route="users"} 500
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
 		} else if n == 2 {
-			// Scrape 2: Simulates explicit Kong worker restart where cumulative counters reset.
-			// GMP's getResetAdjusted sets resetTimestamp to scrapeTime2 - 1ms.
-			w.Write([]byte(fmt.Sprintf(`
-# HELP %s Kong latency
-# TYPE %s histogram
-%s_bucket{route="users",le="100"} 1
-%s_bucket{route="users",le="+Inf"} 1
-%s_count{route="users"} 1
-%s_sum{route="users"} 50
-`, metricName, metricName, metricName, metricName, metricName, metricName)))
-		} else {
-			// Scrape 3: Subsequent normal observation spaced by scrapeInterval (scrapeTime3).
-			// Replays unfixed regression where uncoordinated zero buckets or cache desynchronization
-			// submit an older baseline start time (startTime < scrapeTime2 - 1ms).
+			// Scrape 2 (scrapeTime2): Simulates explicit Kong worker restart where cumulative counter resets.
+			// GMP's getResetAdjusted sets reset timestamp to scrapeTime2 - 1ms.
 			w.Write([]byte(fmt.Sprintf(`
 # HELP %s Kong latency
 # TYPE %s histogram
@@ -202,6 +145,32 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 %s_count{route="users"} 2
 %s_sum{route="users"} 100
 `, metricName, metricName, metricName, metricName, metricName, metricName)))
+		} else if n == 3 {
+			// Scrape 3 (scrapeTime3): Dynamic appearance of newly active zero bucket le="50"
+			// and inconsistent count/sum due to mid-scrape coroutine yielding (count 20 uncoordinated with restart).
+			// In unfixed exporter, le="50" arrives with !hasReset, skipping dist on Scrape 3.
+			w.Write([]byte(fmt.Sprintf(`
+# HELP %s Kong latency
+# TYPE %s histogram
+%s_bucket{route="users",le="50"} 1
+%s_bucket{route="users",le="100"} 12
+%s_bucket{route="users",le="+Inf"} 12
+%s_count{route="users"} 20
+%s_sum{route="users"} 600
+`, metricName, metricName, metricName, metricName, metricName, metricName, metricName)))
+		} else {
+			// Scrape 4 (scrapeTime4): Subsequent normal observation.
+			// Unfixed buildDistribution builds dist taking resetTimestamp from count (scrapeTime1 < scrapeTime2 - 1ms).
+			// Monarch rejects write citing older start time error!
+			w.Write([]byte(fmt.Sprintf(`
+# HELP %s Kong latency
+# TYPE %s histogram
+%s_bucket{route="users",le="50"} 2
+%s_bucket{route="users",le="100"} 14
+%s_bucket{route="users",le="+Inf"} 14
+%s_count{route="users"} 22
+%s_sum{route="users"} 700
+`, metricName, metricName, metricName, metricName, metricName, metricName, metricName)))
 		}
 	}))
 	defer server.Close()
@@ -250,9 +219,10 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 	exporter.metricClient = errClient
 	go exporter.Run()
 
-	appender := newScrapeAppender(exporter)
+	store := NewStorage(exporter)
+	store.metadataFunc = histogramMetadataFunc
 
-	runScrape := func(scrapeTime time.Time, customStart ...time.Time) error {
+	runScrape := func(scrapeTime time.Time) error {
 		resp, err := http.Get(server.URL)
 		if err != nil {
 			return err
@@ -267,6 +237,7 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 			return err
 		}
 
+		appender := store.Appender(ctx)
 		for {
 			et, err := p.Next()
 			if err != nil {
@@ -281,15 +252,6 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 				if timestamp != nil {
 					t = *timestamp
 				}
-				if len(customStart) > 0 {
-					h := storage.SeriesRef(lset.Hash())
-					appender.mtx.Lock()
-					appender.seriesMap[h] = lset
-					appender.mtx.Unlock()
-					if e, ok := exporter.seriesCache.entries[storage.SeriesRef(h)]; ok {
-						e.resetTimestamp = customStart[0].UnixMilli()
-					}
-				}
 				appender.Append(0, lset, t, v)
 			}
 		}
@@ -302,24 +264,29 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 		scrapeInterval = 6 * time.Second
 	}
 
-	// Scrape 1: Initial observation establishing baseline start time (startTime).
+	// Scrape 1: Baseline observation.
 	err = runScrape(startTime)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 2: Writes Point 2 with StartTime startTime, EndTime scrapeTime2.
+	// Scrape 2: Simulates explicit Kong worker restart where cumulative counter resets.
 	scrapeTime2 := startTime.Add(scrapeInterval)
 	err = runScrape(scrapeTime2)
 	require.NoError(t, err)
 
 	time.Sleep(scrapeInterval)
 
-	// Scrape 3: Subsequent normal observation spaced by scrapeInterval (scrapeTime3).
-	// Replays unfixed regression where uncoordinated zero buckets or cache desynchronization
-	// submit an older baseline start time (startTime - 10s < startTime).
+	// Scrape 3: Dynamic appearance of zero bucket le="50" and mid-scrape yielding inconsistency.
 	scrapeTime3 := scrapeTime2.Add(scrapeInterval)
-	err = runScrape(scrapeTime3, startTime.Add(-10*time.Second))
+	err = runScrape(scrapeTime3)
+	require.NoError(t, err)
+
+	time.Sleep(scrapeInterval)
+
+	// Scrape 4: Subsequent normal observation.
+	scrapeTime4 := scrapeTime3.Add(scrapeInterval)
+	err = runScrape(scrapeTime4)
 	require.NoError(t, err)
 
 	time.Sleep(3 * time.Second)
@@ -331,5 +298,5 @@ func TestKongHistogramScrapeMonarchIntegration(t *testing.T) {
 
 	t.Logf("CreateTimeSeries called %d times, errors: %v", calls, errs)
 	assert.GreaterOrEqual(t, calls, 1, "CreateTimeSeries should be called at least once")
-	assert.NotEmpty(t, errs, "Expected at least 1 Cloud Monitoring time series rejection error against Monarch")
+	assert.Empty(t, errs, "Expected Cloud Monitoring writes to succeed without start time rejection errors")
 }
